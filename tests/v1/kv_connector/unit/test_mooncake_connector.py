@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
 )
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from .utils import create_request, create_scheduler, create_vllm_config
@@ -352,6 +353,171 @@ async def test_send_kv_to_decode_aligns_consumer_regions_by_layer_metadata(
         prefill_worker.shutdown()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallback_mode", "expected_calls"),
+    [
+        (None, 2),
+        ("layer_failure", 3),
+        ("block_mismatch", 3),
+    ],
+)
+async def test_layerwise_prefill_commit_or_full_fallback(
+    monkeypatch,
+    fallback_mode: str | None,
+    expected_calls: int,
+):
+    """Final commit skips or repeats the data copy based on layer results."""
+
+    monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        prefill_connector = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        )
+        worker = prefill_connector.connector_worker
+        worker.enable_layerwise_prefill = True
+
+        block_len = 4096
+        layer_names = [
+            "model.layers.0.self_attn",
+            "model.layers.1.self_attn",
+        ]
+        worker.kv_caches_base_addr = [0x1000, 0x3000]
+        worker.block_len_per_layer = [block_len, block_len]
+        worker.kv_block_len_per_layer = [block_len, block_len]
+        worker.registered_layer_names = layer_names
+        worker.registered_layer_indices = [0, 1]
+
+        class InlineSenderLoop:
+            async def run_in_executor(self, executor, func, *args):
+                return func(*args)
+
+        origin_sender_loop = worker.sender_loop
+        worker.sender_loop = InlineSenderLoop()
+
+        transfer_id = "xfer-layerwise"
+        final_blocks = [[10, 11]]
+        early_blocks = (
+            [[10, 12]] if fallback_mode == "block_mismatch" else [[10, 11]]
+        )
+        send_meta = SendBlockMeta(
+            p_req_id="p-req-layerwise",
+            transfer_id=transfer_id,
+            local_block_ids=final_blocks,
+            ready=asyncio.Event(),
+            early_block_ids=early_blocks,
+        )
+        send_meta.early_ready.set()
+        send_meta.ready.set()
+        cuda_events = []
+        for layer_name in layer_names:
+            cuda_event = MagicMock()
+            cuda_events.append(cuda_event)
+            send_meta.layer_cuda_events[layer_name] = cuda_event
+            send_meta.layer_ready[layer_name] = asyncio.Event()
+            send_meta.layer_ready[layer_name].set()
+        worker.reqs_need_send[transfer_id] = send_meta
+
+        xfer_meta = MooncakeXferMetadata(
+            remote_hostname="consumer-host",
+            remote_port=54321,
+            remote_tp_size=1,
+            remote_tp_rank=0,
+            req_blocks={"d-req-layerwise": (transfer_id, [[20, 21]])},
+            kv_caches_base_addr=[0x5000, 0x7000],
+            block_lens=[block_len, block_len],
+            kv_block_lens=[block_len, block_len],
+            registered_layer_names=layer_names,
+            registered_layer_indices=[0, 1],
+        )
+        mock_socket = AsyncMock(spec=zmq.asyncio.Socket)
+        mock_socket.send_multipart = AsyncMock()
+
+        transfer_results = (
+            [0, 7, 0] if fallback_mode == "layer_failure" else [0] * expected_calls
+        )
+        with patch.object(
+            worker,
+            "_send_blocks",
+            side_effect=transfer_results,
+        ) as mock_send_blocks:
+            await worker.send_kv_to_decode(b"consumer-layerwise", mock_socket, xfer_meta)
+
+        assert mock_send_blocks.call_count == expected_calls
+        for cuda_event in cuda_events:
+            cuda_event.synchronize.assert_called_once()
+
+        descriptor_counts = [
+            len(call.args[1]) for call in mock_send_blocks.call_args_list
+        ]
+        expected_layer_descs = (
+            [2, 2] if fallback_mode == "block_mismatch" else [1, 1]
+        )
+        assert descriptor_counts[:2] == expected_layer_descs
+        if fallback_mode is not None:
+            assert descriptor_counts[-1] == 2
+
+        _, sent_payload = mock_socket.send_multipart.call_args[0][0]
+        response = worker._xfer_resp_decoder.decode(sent_payload)
+        assert response.status == MooncakeXferResponseStatus.FINISH
+        assert response.ok_reqs == ["d-req-layerwise"]
+        assert response.err_reqs is None
+        assert "p-req-layerwise" in worker.finished_sending_reqs
+
+        worker.sender_loop = origin_sender_loop
+        worker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_final_chunk_metadata_arms_layerwise_save_without_send_metadata():
+    """A later final chunk must be recorded even without a new send request."""
+
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.is_kv_producer = True
+    worker.is_kv_consumer = False
+    worker.enable_layerwise_prefill = True
+    worker.sender_loop = asyncio.get_running_loop()
+    worker.reqs_need_send = {}
+    worker.shutdown = MagicMock()
+
+    transfer_id = "xfer-final-chunk"
+    send_meta = SendBlockMeta(
+        p_req_id="p-req-final-chunk",
+        transfer_id=transfer_id,
+        local_block_ids=[],
+        ready=asyncio.Event(),
+    )
+    worker.reqs_need_send[transfer_id] = send_meta
+    metadata = MooncakeConnectorMetadata()
+    metadata.final_prefill_block_ids = {
+        "p-req-final-chunk": ([10, 11, 12],)
+    }
+
+    worker.start_load_kv(metadata)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert send_meta.early_ready.is_set()
+    assert send_meta.early_block_ids == [[10, 11, 12]]
+
+    cuda_event = MagicMock()
+    await worker._record_layer_save(
+        "model.layers.0.self_attn",
+        cuda_event,
+        metadata.final_prefill_block_ids,
+    )
+    assert send_meta.layer_cuda_events == {
+        "model.layers.0.self_attn": cuda_event
+    }
+    assert send_meta.layer_ready["model.layers.0.self_attn"].is_set()
+
+
 def test_basic_interface():
     """Unit test for basic MooncakeConnector interface functionality."""
 
@@ -653,6 +819,52 @@ def test_scheduler_request_finished():
     assert delay_free is False
     assert len(scheduler_connector._reqs_need_send) == 0
     assert "id-1" in scheduler_connector._reqs_not_processed
+
+
+def test_scheduler_output_has_authoritative_final_prefill_blocks():
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        max_num_batched_tokens=32,
+        block_size=16,
+    )
+    scheduler = create_scheduler(vllm_config)
+    request = create_request(
+        request_id=1,
+        num_tokens=35,
+        max_tokens=1,
+        do_remote_decode=True,
+        block_size=16,
+    )
+    request.kv_transfer_params["transfer_id"] = request.request_id
+    scheduler.add_request(request)
+
+    first_output = scheduler.schedule()
+    assert first_output.final_prefill_block_ids == {}
+
+    scheduler.update_from_output(
+        first_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[]],
+        ),
+    )
+
+    second_output = scheduler.schedule()
+    expected = scheduler.kv_cache_manager.get_block_ids_for_computed_tokens(
+        request_id=request.request_id,
+        num_computed_tokens=request.num_prompt_tokens,
+    )
+    assert second_output.final_prefill_block_ids == {
+        request.request_id: expected
+    }
+    assert len(expected[0]) == 3
+    second_meta = second_output.kv_connector_metadata
+    assert isinstance(second_meta, MooncakeConnectorMetadata)
+    assert second_meta.final_prefill_block_ids == {
+        request.request_id: expected
+    }
 
 
 @contextlib.contextmanager

@@ -1296,6 +1296,27 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        final_prefill_block_ids: dict[str, tuple[list[int], ...]] = {}
+        if self.connector is not None:
+            scheduled_reqs = itertools.chain(
+                scheduled_new_reqs,
+                scheduled_resumed_reqs,
+                scheduled_running_reqs,
+            )
+            for request in scheduled_reqs:
+                num_scheduled = num_scheduled_tokens[request.request_id]
+                if not (
+                    request.num_computed_tokens < request.num_prompt_tokens
+                    <= request.num_computed_tokens + num_scheduled
+                ):
+                    continue
+                final_prefill_block_ids[request.request_id] = (
+                    self.kv_cache_manager.get_block_ids_for_computed_tokens(
+                        request_id=request.request_id,
+                        num_computed_tokens=request.num_prompt_tokens,
+                    )
+                )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1317,6 +1338,7 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            final_prefill_block_ids=final_prefill_block_ids,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

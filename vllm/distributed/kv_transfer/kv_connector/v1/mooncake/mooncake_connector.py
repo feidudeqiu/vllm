@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import inspect
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import IntEnum
+from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -65,6 +68,177 @@ from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
+
+_ROWAN_VLLM_INTERFACE_NAMES = (
+    "__init__",
+    "prefer_cross_layer_blocks",
+    "supports_divergent_local_hybrid_hits",
+    "requires_kv_delivery",
+    "role",
+    "bind_connector_metadata",
+    "clear_connector_metadata",
+    "has_connector_metadata",
+    "register_kv_caches",
+    "register_cross_layers_kv_cache",
+    "set_host_xfer_buffer_ops",
+    "handle_preemptions",
+    "start_load_kv",
+    "wait_for_layer_load",
+    "save_kv_layer",
+    "wait_for_save",
+    "get_finished",
+    "get_block_ids_with_load_errors",
+    "shutdown",
+    "get_kv_connector_stats",
+    "get_kv_connector_kv_cache_events",
+    "get_handshake_metadata",
+    "build_connector_worker_meta",
+    "bind_gpu_block_pool",
+    "get_num_new_matched_tokens",
+    "update_state_after_alloc",
+    "build_connector_meta",
+    "on_new_request",
+    "update_connector_output",
+    "request_finished",
+    "request_finished_all_groups",
+    "take_events",
+    "has_pending_push_work",
+    "get_required_kvcache_layout",
+    "requires_piecewise_for_cudagraph",
+    "get_finished_count",
+    "build_kv_connector_stats",
+    "set_xfer_handshake_metadata",
+    "set_xfer_handshake_metadata_pp_aware",
+    "build_prom_metrics",
+    "reset_cache",
+)
+
+
+def _rowan_format_log_value(value: Any, active_ids: set[int] | None = None) -> str:
+    """Format connector arguments without materializing tensor contents."""
+    if isinstance(value, torch.Tensor):
+        return (
+            f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
+            f"device={value.device})"
+        )
+
+    if active_ids is None:
+        active_ids = set()
+
+    value_id = id(value)
+    if value_id in active_ids:
+        return f"<{type(value).__name__} ...>"
+
+    if is_dataclass(value) and not isinstance(value, type):
+        active_ids.add(value_id)
+        try:
+            field_values = ", ".join(
+                f"{field.name}="
+                f"{_rowan_format_log_value(getattr(value, field.name), active_ids)}"
+                for field in fields(value)
+            )
+            return f"{type(value).__name__}({field_values})"
+        finally:
+            active_ids.remove(value_id)
+
+    if isinstance(value, dict):
+        active_ids.add(value_id)
+        try:
+            entries = ", ".join(
+                f"{key!r}: {_rowan_format_log_value(item, active_ids)}"
+                for key, item in value.items()
+            )
+            return f"{{{entries}}}"
+        finally:
+            active_ids.remove(value_id)
+
+    if isinstance(value, tuple):
+        active_ids.add(value_id)
+        try:
+            entries = ", ".join(
+                _rowan_format_log_value(item, active_ids) for item in value
+            )
+            if len(value) == 1:
+                entries += ","
+            return f"({entries})"
+        finally:
+            active_ids.remove(value_id)
+
+    if isinstance(value, list):
+        active_ids.add(value_id)
+        try:
+            entries = ", ".join(
+                _rowan_format_log_value(item, active_ids) for item in value
+            )
+            return f"[{entries}]"
+        finally:
+            active_ids.remove(value_id)
+
+    if isinstance(value, (set, frozenset)):
+        if not value:
+            return "set()" if isinstance(value, set) else "frozenset()"
+        active_ids.add(value_id)
+        try:
+            entries = ", ".join(
+                _rowan_format_log_value(item, active_ids) for item in value
+            )
+            if isinstance(value, frozenset):
+                return f"frozenset({{{entries}}})"
+            return f"{{{entries}}}"
+        finally:
+            active_ids.remove(value_id)
+
+    return repr(value)
+
+
+def _rowan_log_vllm_call(method_name: str, method: Any, *, drop_first: bool = True):
+    """Log every argument crossing the vLLM-to-connector API boundary."""
+
+    @wraps(method)
+    def wrapped(*args: Any, **kwargs: Any):
+        call_args = args[1:] if drop_first and args else args
+        log_prefix = os.getenv("ROWAN_CONNECTOR_LOG_PREFIX", "ROWAN")
+        logger.info(
+            "%s vLLM interface=%s args=%s kwargs=%s",
+            log_prefix,
+            method_name,
+            _rowan_format_log_value(call_args),
+            _rowan_format_log_value(kwargs),
+        )
+        return method(*args, **kwargs)
+
+    return wrapped
+
+
+def _rowan_log_vllm_interfaces(cls: type):
+    """Instrument the complete KVConnectorBase_V1 surface on this connector."""
+
+    for method_name in _ROWAN_VLLM_INTERFACE_NAMES:
+        descriptor = inspect.getattr_static(cls, method_name)
+        if isinstance(descriptor, classmethod):
+            wrapped = _rowan_log_vllm_call(method_name, descriptor.__func__)
+            setattr(cls, method_name, classmethod(wrapped))
+        elif isinstance(descriptor, staticmethod):
+            wrapped = _rowan_log_vllm_call(
+                method_name, descriptor.__func__, drop_first=False
+            )
+            setattr(cls, method_name, staticmethod(wrapped))
+        elif isinstance(descriptor, property):
+            assert descriptor.fget is not None
+            wrapped_getter = _rowan_log_vllm_call(method_name, descriptor.fget)
+            setattr(
+                cls,
+                method_name,
+                property(
+                    wrapped_getter,
+                    descriptor.fset,
+                    descriptor.fdel,
+                    descriptor.__doc__,
+                ),
+            )
+        else:
+            setattr(cls, method_name, _rowan_log_vllm_call(method_name, descriptor))
+    return cls
 
 try:
     from mooncake.engine import TransferEngine
@@ -409,6 +583,11 @@ class SendBlockMeta:
     transfer_id: TransferId
     local_block_ids: list[list[int]]
     ready: asyncio.Event
+    early_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    early_block_ids: list[list[int]] | None = None
+    layer_ready: dict[str, asyncio.Event] = field(default_factory=dict)
+    layer_cuda_events: dict[str, Any] = field(default_factory=dict)
+    layerwise_failed: bool = False
     expire_time: float = float("inf")
     need_send: int = 0
     sent: int = 0
@@ -422,6 +601,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[EngineId, dict[ReqId, PullReqMeta]] = defaultdict(dict)
         self.reqs_to_send: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
         self.reqs_not_processed: set[TransferId] = set()
+        self.final_prefill_block_ids: dict[ReqId, tuple[list[int], ...]] = {}
 
     def add_new_req(
         self,
@@ -444,6 +624,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
 
 
+@_rowan_log_vllm_interfaces
 class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
@@ -470,6 +651,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_worker = MooncakeConnectorWorker(
                 vllm_config, self.engine_id, kv_cache_config
             )
+        self._layer_save_futures: list[Future[None]] = []
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig):
@@ -562,11 +744,28 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> None:
-        """MooncakeConnector does not save explicitly."""
-        pass
+        assert self.connector_worker is not None
+        assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
+        if (
+            not self.connector_worker.enable_layerwise_prefill
+            or not self._connector_metadata.final_prefill_block_ids
+        ):
+            return
+
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        future = self.connector_worker.schedule_layer_save(
+            layer_name,
+            event,
+            self._connector_metadata.final_prefill_block_ids,
+        )
+        self._layer_save_futures.append(future)
 
     def wait_for_save(self):
-        pass
+        futures = self._layer_save_futures
+        self._layer_save_futures = []
+        for future in futures:
+            future.result()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Return worker-local transfer stats since the last call.
@@ -786,6 +985,12 @@ class MooncakeConnectorScheduler:
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata()
+        meta.final_prefill_block_ids = {
+            req_id: tuple(
+                list(group) for group in self.get_sw_clipped_blocks(block_ids)
+            )
+            for req_id, block_ids in scheduler_output.final_prefill_block_ids.items()
+        }
 
         # Loop through scheduled reqs and convert to PullReqMeta.
         if not self.is_kv_producer:
@@ -899,6 +1104,12 @@ class MooncakeConnectorWorker:
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
             "num_workers", 10
         )
+        self.enable_layerwise_prefill = (
+            kv_transfer_config.kv_connector_extra_config.get(
+                "enable_layerwise_prefill", False
+            )
+        )
+        self.rowan_log_prefix = os.getenv("ROWAN_CONNECTOR_LOG_PREFIX", "ROWAN")
         # Create more tasks than workers to keep the thread pool saturated.
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
@@ -1239,9 +1450,15 @@ class MooncakeConnectorWorker:
 
         async def wait_and_ret(
             d_req_id: ReqId, send_meta: SendBlockMeta
-        ) -> tuple[ReqId, SendBlockMeta]:
-            await send_meta.ready.wait()
-            return d_req_id, send_meta
+        ) -> tuple[ReqId, SendBlockMeta, bool]:
+            layerwise_complete = await self._try_layerwise_transfer(
+                d_req_id,
+                send_meta,
+                meta,
+                local_regions,
+                remote_regions,
+            )
+            return d_req_id, send_meta, layerwise_complete
 
         wait_tasks = [
             asyncio.create_task(wait_and_ret(d_req_id, send_meta))
@@ -1277,8 +1494,9 @@ class MooncakeConnectorWorker:
                 else MooncakeXferResponseStatus.FINISH
             )
             ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
+            layerwise_complete_reqs: set[ReqId] = set()
             for task in done:
-                d_req_id, send_meta = task.result()
+                d_req_id, send_meta, layerwise_complete = task.result()
                 del pending_reqs[d_req_id]
                 # Do we still in reqs_need_send (not expired)?
                 if send_meta.transfer_id in self.reqs_need_send:
@@ -1287,6 +1505,8 @@ class MooncakeConnectorWorker:
                     if not send_meta.need_send:
                         self.resolve_need_send(send_meta, remote_tp_ranks)
                     ready_reqs.append((d_req_id, send_meta))
+                    if layerwise_complete:
+                        layerwise_complete_reqs.add(d_req_id)
                 else:
                     # Otherwise (expired, very unlikely), just forget it.
                     logger.warning(
@@ -1300,7 +1520,11 @@ class MooncakeConnectorWorker:
                 err_reqs,
                 err_msg,
             ) = await self._build_transfer_params(
-                ready_reqs,
+                [
+                    (d_req_id, send_meta)
+                    for d_req_id, send_meta in ready_reqs
+                    if d_req_id not in layerwise_complete_reqs
+                ],
                 meta,
                 local_regions,
                 remote_regions,
@@ -1403,6 +1627,8 @@ class MooncakeConnectorWorker:
         agent_meta: MooncakeXferMetadata,
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
+        layer_name: str | None = None,
+        use_early_blocks: bool = False,
     ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
         src_ptrs = []
         dst_ptrs = []
@@ -1413,17 +1639,27 @@ class MooncakeConnectorWorker:
 
         for d_req_id, send_meta in ready_reqs:
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
+            local_block_ids = (
+                send_meta.early_block_ids
+                if use_early_blocks
+                else send_meta.local_block_ids
+            )
+            if local_block_ids is None:
+                err_reqs.append(d_req_id)
+                if err_msg is None:
+                    err_msg = "P layerwise block table is not ready"
+                continue
 
             if not remote_block_ids_per_group or all(
                 len(g) == 0 for g in remote_block_ids_per_group
             ):
                 continue
 
-            if len(send_meta.local_block_ids) != len(remote_block_ids_per_group):
+            if len(local_block_ids) != len(remote_block_ids_per_group):
                 logger.error(
                     "req %s: KV group count mismatch: local=%d, remote=%d",
                     d_req_id,
-                    len(send_meta.local_block_ids),
+                    len(local_block_ids),
                     len(remote_block_ids_per_group),
                 )
                 err_reqs.append(d_req_id)
@@ -1440,7 +1676,7 @@ class MooncakeConnectorWorker:
             has_block_error = False
             group_specs = self.kv_cache_config.kv_cache_groups
             for group_index, (local_group, remote_group) in enumerate(
-                zip(send_meta.local_block_ids, remote_block_ids_per_group)
+                zip(local_block_ids, remote_block_ids_per_group)
             ):
                 is_mamba_group = isinstance(
                     group_specs[group_index].kv_cache_spec,
@@ -1497,6 +1733,8 @@ class MooncakeConnectorWorker:
             )
 
             for local_region, remote_region in zip(local_regions, remote_regions):
+                if layer_name is not None and local_region.layer_name != layer_name:
+                    continue
                 assert local_region.group_index == remote_region.group_index, (
                     "Aligned Mooncake transfer regions must belong to the same "
                     "KV group."
@@ -1588,6 +1826,171 @@ class MooncakeConnectorWorker:
             )
 
         return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
+
+    def _send_layer_blocks(
+        self,
+        cuda_event: Any,
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+    ) -> int:
+        cuda_event.synchronize()
+        return self._send_blocks(remote_session, src_ptrs, dst_ptrs, lengths)
+
+    async def _transfer_layer_when_ready(
+        self,
+        d_req_id: ReqId,
+        send_meta: SendBlockMeta,
+        agent_meta: MooncakeXferMetadata,
+        local_regions: list[TransferRegion],
+        remote_regions: list[TransferRegion],
+        layer_name: str,
+    ) -> bool:
+        layer_ready = send_meta.layer_ready.setdefault(layer_name, asyncio.Event())
+        await layer_ready.wait()
+        cuda_event = send_meta.layer_cuda_events[layer_name]
+        src_ptrs, dst_ptrs, lengths, err_reqs, err_msg = (
+            await self._build_transfer_params(
+                [(d_req_id, send_meta)],
+                agent_meta,
+                local_regions,
+                remote_regions,
+                layer_name=layer_name,
+                use_early_blocks=True,
+            )
+        )
+        if err_reqs:
+            send_meta.layerwise_failed = True
+            logger.warning(
+                "%s layerwise prefill could not build layer %s for "
+                "request %s: %s",
+                self.rowan_log_prefix,
+                layer_name,
+                d_req_id,
+                err_msg,
+            )
+            return False
+        if not src_ptrs:
+            return True
+
+        remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
+        ret_value = await self.sender_loop.run_in_executor(
+            self._sender_executor,
+            self._send_layer_blocks,
+            cuda_event,
+            remote_session,
+            src_ptrs,
+            dst_ptrs,
+            lengths,
+        )
+        if ret_value != 0:
+            send_meta.layerwise_failed = True
+            logger.warning(
+                "%s layerwise prefill failed for layer %s request %s "
+                "(ret=%s); the request will use the full fallback.",
+                self.rowan_log_prefix,
+                layer_name,
+                d_req_id,
+                ret_value,
+            )
+            return False
+        logger.info(
+            "%s layerwise prefill sent layer %s for request %s",
+            self.rowan_log_prefix,
+            layer_name,
+            d_req_id,
+        )
+        return True
+
+    async def _try_layerwise_transfer(
+        self,
+        d_req_id: ReqId,
+        send_meta: SendBlockMeta,
+        agent_meta: MooncakeXferMetadata,
+        local_regions: list[TransferRegion],
+        remote_regions: list[TransferRegion],
+    ) -> bool:
+        if not self.enable_layerwise_prefill:
+            await send_meta.ready.wait()
+            return False
+
+        if not send_meta.early_ready.is_set():
+            early_wait = asyncio.create_task(send_meta.early_ready.wait())
+            final_wait = asyncio.create_task(send_meta.ready.wait())
+            done, pending = await asyncio.wait(
+                [early_wait, final_wait],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if final_wait in done and not send_meta.early_ready.is_set():
+                return False
+
+        expected_layers = list(
+            dict.fromkeys(region.layer_name for region in local_regions)
+        )
+        if not expected_layers or send_meta.early_block_ids is None:
+            await send_meta.ready.wait()
+            return False
+
+        layer_tasks = {
+            layer_name: asyncio.create_task(
+                self._transfer_layer_when_ready(
+                    d_req_id,
+                    send_meta,
+                    agent_meta,
+                    local_regions,
+                    remote_regions,
+                    layer_name,
+                )
+            )
+            for layer_name in expected_layers
+        }
+        try:
+            await send_meta.ready.wait()
+            observed_layers = set(send_meta.layer_cuda_events)
+            missing_layers = set(expected_layers) - observed_layers
+            for layer_name in missing_layers:
+                layer_tasks[layer_name].cancel()
+
+            results = await asyncio.gather(
+                *layer_tasks.values(), return_exceptions=True
+            )
+            layers_ok = all(result is True for result in results)
+            block_ids_match = (
+                send_meta.early_block_ids == send_meta.local_block_ids
+            )
+            if (
+                layers_ok
+                and not missing_layers
+                and not send_meta.layerwise_failed
+                and block_ids_match
+            ):
+                logger.info(
+                    "%s layerwise prefill completed request %s; "
+                    "skipping the full-request data copy.",
+                    self.rowan_log_prefix,
+                    d_req_id,
+                )
+                return True
+
+            logger.info(
+                "%s layerwise prefill falling back for request %s "
+                "(missing_layers=%s, layer_failed=%s, block_ids_match=%s)",
+                self.rowan_log_prefix,
+                d_req_id,
+                sorted(missing_layers),
+                send_meta.layerwise_failed,
+                block_ids_match,
+            )
+            return False
+        finally:
+            pending_tasks = [task for task in layer_tasks.values() if not task.done()]
+            for task in pending_tasks:
+                task.cancel()
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     def _bind_sender_thread_device(self) -> None:
         """ThreadPoolExecutor initializer — binds each pool thread to the
@@ -1992,10 +2395,71 @@ class MooncakeConnectorWorker:
                         local_block_ids=[],
                         ready=asyncio.Event(),
                     )
+        if self.enable_layerwise_prefill:
+            for p_req_id, block_ids in metadata.final_prefill_block_ids.items():
+                send_meta = self._find_send_meta_by_p_req_id(p_req_id)
+                if send_meta is None:
+                    logger.warning(
+                        "Mooncake layerwise prefill could not find transfer state "
+                        "for request %s; the request will use the full fallback.",
+                        p_req_id,
+                    )
+                    continue
+                send_meta.early_block_ids = [list(group) for group in block_ids]
+                send_meta.early_ready.set()
         for transfer_id in metadata.reqs_not_processed:
             send_meta = self.reqs_need_send.pop(transfer_id)
             if send_meta:
                 assert not send_meta.ready.is_set()
+
+    def _find_send_meta_by_p_req_id(self, p_req_id: ReqId) -> SendBlockMeta | None:
+        for send_meta in self.reqs_need_send.values():
+            if send_meta.p_req_id == p_req_id:
+                return send_meta
+        return None
+
+    async def _record_layer_save(
+        self,
+        layer_name: str,
+        cuda_event: Any,
+        final_prefill_block_ids: dict[ReqId, tuple[list[int], ...]],
+    ) -> None:
+        for p_req_id in final_prefill_block_ids:
+            send_meta = self._find_send_meta_by_p_req_id(p_req_id)
+            if send_meta is None:
+                logger.warning(
+                    "Mooncake layerwise prefill could not associate layer %s "
+                    "with request %s; the request will use the full fallback.",
+                    layer_name,
+                    p_req_id,
+                )
+                continue
+            if layer_name in send_meta.layer_cuda_events:
+                send_meta.layerwise_failed = True
+                logger.warning(
+                    "Mooncake layerwise prefill observed layer %s more than once "
+                    "for request %s; the request will use the full fallback.",
+                    layer_name,
+                    p_req_id,
+                )
+                continue
+            send_meta.layer_cuda_events[layer_name] = cuda_event
+            send_meta.layer_ready.setdefault(layer_name, asyncio.Event()).set()
+
+    def schedule_layer_save(
+        self,
+        layer_name: str,
+        cuda_event: Any,
+        final_prefill_block_ids: dict[ReqId, tuple[list[int], ...]],
+    ) -> Future[None]:
+        return asyncio.run_coroutine_threadsafe(
+            self._record_layer_save(
+                layer_name,
+                cuda_event,
+                final_prefill_block_ids,
+            ),
+            self.sender_loop,
+        )
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
@@ -2004,7 +2468,9 @@ class MooncakeConnectorWorker:
             )
 
         if not self.is_kv_consumer and (
-            metadata.reqs_to_send or metadata.reqs_not_processed
+            metadata.reqs_to_send
+            or metadata.reqs_not_processed
+            or metadata.final_prefill_block_ids
         ):
             asyncio.run_coroutine_threadsafe(
                 self.record_send_reqs(metadata), self.sender_loop
